@@ -44,6 +44,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       void *seqused_k,
                       void *p_d,
                       void *softmax_lse_d,
+                      void *softmax_rowmax_d,
+                      void *softmax_sumexp_d,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
@@ -92,6 +94,8 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Softmax sum
     params.softmax_lse_ptr = softmax_lse_d;
+    params.softmax_rowmax_ptr = softmax_rowmax_d; 
+    params.softmax_sumexp_ptr = softmax_sumexp_d;
 
     // Set the dimensions.
     params.b = b;
@@ -201,6 +205,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                      nullptr,
                      nullptr,
                      softmax_lse_d,
+                     nullptr,
+                     nullptr,
                      p_dropout,
                      softmax_scale,
                      window_size_left,
@@ -439,6 +445,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     auto opts = q.options();
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    auto rowmax        = torch::empty_like(softmax_lse);   // NEW  mᵢ
+    auto sumexp        = torch::empty_like(softmax_lse);   // NEW  dᵢ
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
@@ -462,6 +470,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      /*seqused_k=*/nullptr,
                      return_softmax ? p.data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
+                     rowmax.data_ptr(),
+                     sumexp.data_ptr(),
                      p_dropout,
                      softmax_scale,
                      window_size_left,
@@ -508,7 +518,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse, p, rng_state};
+    return {out, softmax_lse, rowmax, sumexp, p, rng_state};
 }
 
 std::vector<at::Tensor>
@@ -650,6 +660,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     auto opts = q.options();
     auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+    auto rowmax        = torch::empty_like(softmax_lse);
+    auto sumexp        = torch::empty_like(softmax_lse);
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
@@ -679,6 +691,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
                      return_softmax ? p.data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
+                     rowmax.data_ptr(),
+                     sumexp.data_ptr(),
                      p_dropout,
                      softmax_scale,
                      window_size_left,
@@ -751,7 +765,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
     }
 
-    return {out, softmax_lse, p, rng_state};
+    return {out, softmax_lse, rowmax, sumexp, p, rng_state};
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
@@ -1328,6 +1342,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto opts = q.options();
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    auto rowmax       = torch::empty_like(softmax_lse);
+    auto sumexp       = torch::empty_like(softmax_lse); 
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -1342,6 +1358,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*seqused_k=*/nullptr,
                      /*p_ptr=*/nullptr,
                      softmax_lse.data_ptr(),
+                     rowmax.data_ptr(),
+                     sumexp.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
                      window_size_left,
@@ -1471,7 +1489,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse};
+    return {out, softmax_lse, rowmax, sumexp};
 }
 } // namespace FLASH_NAMESPACE
 

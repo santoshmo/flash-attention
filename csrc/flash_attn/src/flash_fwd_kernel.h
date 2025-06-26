@@ -47,6 +47,49 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
         return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
 }
 
+template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
+__forceinline__ __device__ auto get_rowmax_tile(const Params &params,
+                                                int bidb, int bidh, int m_block,
+                                                const BlockInfo<!Is_even_MN> &binfo) {
+    auto gmem_ptr = make_gmem_ptr(
+        reinterpret_cast<ElementAccum*>(params.softmax_rowmax_ptr)
+        + (params.unpadded_lse && !params.seqlenq_ngroups_swapped
+           ? binfo.q_offset(params.seqlen_q, 1, bidb) : 0));
+    auto layout = params.unpadded_lse && !params.seqlenq_ngroups_swapped
+                  ? make_layout(make_shape(1, params.h, params.total_q),
+                                 make_stride(params.h * params.total_q,
+                                             params.total_q, 1))
+                  : make_layout(make_shape(params.b, params.h, params.seqlen_q),
+                                 make_stride(params.h * params.seqlen_q,
+                                             params.seqlen_q, 1));
+    Tensor mRowMax = make_tensor(gmem_ptr, layout);
+    auto slice = params.unpadded_lse && !params.seqlenq_ngroups_swapped
+                   ? mRowMax(0, bidh, _)
+                   : mRowMax(bidb, bidh, _);
+    return local_tile(slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
+}
+
+template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
+__forceinline__ __device__ auto get_sumexp_tile(const Params &params,
+                                                int bidb, int bidh, int m_block,
+                                                const BlockInfo<!Is_even_MN> &binfo) {
+    auto gmem_ptr = make_gmem_ptr(
+        reinterpret_cast<ElementAccum*>(params.softmax_sumexp_ptr)
+        + (params.unpadded_lse && !params.seqlenq_ngroups_swapped
+           ? binfo.q_offset(params.seqlen_q, 1, bidb) : 0));
+    auto layout = params.unpadded_lse && !params.seqlenq_ngroups_swapped
+                  ? make_layout(make_shape(1, params.h, params.total_q),
+                                 make_stride(params.h * params.total_q,
+                                             params.total_q, 1))
+                  : make_layout(make_shape(params.b, params.h, params.seqlen_q),
+                                 make_stride(params.h * params.seqlen_q,
+                                             params.seqlen_q, 1));
+    Tensor mSumExp = make_tensor(gmem_ptr, layout);
+    auto slice = params.unpadded_lse && !params.seqlenq_ngroups_swapped
+                   ? mSumExp(0, bidh, _)
+                   : mSumExp(bidb, bidh, _);
+    return local_tile(slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
+}
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
@@ -425,12 +468,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
+
 
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
@@ -453,7 +497,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
-
+    Tensor gRowMax = get_rowmax_tile<ElementAccum, Params, kBlockM, Is_even_MN>(
+                params, bidb, bidh, m_block, binfo);
+    Tensor gSumExp = get_sumexp_tile<ElementAccum, Params, kBlockM, Is_even_MN>(
+                params, bidb, bidh, m_block, binfo);
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
@@ -468,13 +515,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
     static_assert(decltype(size<0>(taccOcO))::value == 4);
     // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
+    auto stats = softmax.template normalize_softmax_lse_stats<Is_dropout>(
+                 acc_o, params.scale_softmax, params.rp_dropout);
     Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
-    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size(stats.lse) == size(taccOcO_row));                     // MMA_M
     if (get<1>(taccOcO_row(0)) == 0) {
         #pragma unroll
-        for (int mi = 0; mi < size(lse); ++mi) {
+        for (int mi = 0; mi < size(stats.lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { 
+                gLSE(row) = stats.lse(mi); 
+                gRowMax(row) = stats.row_max(mi);
+                gSumExp(row) = stats.sum_exp(mi);
+            }
         }
     }
 
@@ -1045,13 +1098,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
     static_assert(decltype(size<0>(taccOcO))::value == 4);
     // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
+    auto stats = softmax.template normalize_softmax_lse_stats</*Is_dropout=*/false>(
+                 acc_o, params.scale_softmax, params.rp_dropout);
     Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
-    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size(stats.lse) == size(taccOcO_row));                     // MMA_M
     if (get<1>(taccOcO_row(0)) == 0) {
         #pragma unroll
-        for (int mi = 0; mi < size(lse); ++mi) {
+        for (int mi = 0; mi < size(stats.lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSEaccum(row) = stats.lse(mi); }
         }
     }
 
@@ -1068,27 +1123,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
-inline __device__ void compute_attn(const Params &params) {
-    const int m_block = blockIdx.x;
-    // The block index for the batch.
-    const int bidb = blockIdx.y;
-    // The block index for the head.
-    const int bidh = blockIdx.z;
-
-    // We want the fwd and bwd to generate the same dropout pattern (RNG), without restricting
-    // them to have the same number of threads or have to traverse the attention matrix
-    // in the same order.
-    // In the Philox RNG, we use the offset to store the batch, head, and the lane id
-    // (within a warp). We use the subsequence to store the location of the 16 x 32 blocks within
-    // the attention matrix. This way, as long as we have the batch, head, and the location of
-    // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
-
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1289,6 +1323,39 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             }
         }
     }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<
+    typename Kernel_traits,
+    bool Is_dropout,
+    bool Is_causal,
+    bool Is_local,
+    bool Has_alibi,
+    bool Is_even_MN,
+    bool Is_even_K,
+    bool Is_softcap,
+    bool Return_softmax,
+    typename Params>
+inline __device__ void compute_attn(const Params &params) {
+    // Grid layout:  blockIdx.x = m_block (query tile)
+    //                blockIdx.y = batch index
+    //                blockIdx.z = head index
+    const int m_block = blockIdx.x;
+    const int bidb    = blockIdx.y;
+    const int bidh    = blockIdx.z;
+
+    FLASH_NAMESPACE::compute_attn_1rowblock<
+        Kernel_traits,
+        Is_dropout,
+        Is_causal,
+        Is_local,
+        Has_alibi,
+        Is_even_MN,
+        Is_even_K,
+        Is_softcap,
+        Return_softmax>(params, bidb, bidh, m_block);
 }
 
 } // namespace FLASH_NAMESPACE

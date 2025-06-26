@@ -128,8 +128,17 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
 template <int kNRows>
 struct Softmax {
 
+    template<typename TensorT_>
+    struct SoftmaxStats {
+        TensorT_ lse;
+        TensorT_ row_max;
+        TensorT_ sum_exp;
+    };
+    
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
+    __forceinline__ __device__ float       &sum_exp(int idx)       { return row_sum(idx); }
+    __forceinline__ __device__ const float &sum_exp(int idx) const { return row_sum(idx); }
 
     __forceinline__ __device__ Softmax() {};
 
@@ -184,6 +193,18 @@ struct Softmax {
         }
         return lse;
     };
+
+    template<bool Is_dropout =  false, bool Split = false, typename Tensor0>
+    __forceinline__ __device__ SoftmaxStats<TensorT> normalize_softmax_lse_stats(Tensor0 &acc_o,
+                                                    float   softmax_scale,
+                                                    float   rp_dropout = 1.f) {
+        // Run the original code – it fills `row_max`, `row_sum`, etc.
+        TensorT lse = normalize_softmax_lse<Is_dropout, Split>(
+                        acc_o, softmax_scale, rp_dropout);
+
+        // Pack everything and return
+        return {lse, row_max, row_sum};    // `row_sum` already exists in the object
+    }
 };
 
 }  // namespace FLASH_NAMESPACE
