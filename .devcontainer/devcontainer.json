@@ -1,0 +1,17 @@
+{
+    "name": "FlashAttention GPU Dev",
+    "image": "myflashattention:latest",
+    "runArgs": [
+      "--gpus=all",
+      "--env", "NVIDIA_VISIBLE_DEVICES=all"
+    ],
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "extensions": [
+      "ms-python.python",
+      "ms-vscode.cpptools"
+    ],
+    "settings": {
+      "terminal.integrated.shell.linux": "/bin/bash"
+    }
+  }
