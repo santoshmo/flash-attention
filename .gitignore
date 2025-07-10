@@ -29,3 +29,4 @@ var/
 
 # Dev
 venv
+examples/multi_gpu_flash/pipelined_fa.o

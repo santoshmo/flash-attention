@@ -11,6 +11,7 @@
 #include <nccl.h>
 #include <cmath>
 #include <cuda_fp16.h>
+#include <pybind11/pybind11.h>
 
 #include "flash.h"    // flash_attn fprop kernel declarations
 #include "flash_api.h"
@@ -259,15 +260,28 @@ torch::Tensor pipelined_fa(
   torch::Tensor v,
   int chunk_size,
   int nccl_world_size,
-  int nccl_rank
+  int nccl_rank,
+  pybind11::bytes uid_bytes = pybind11::bytes()
 ) {
   ncclUniqueId uid;
-  NCCL_CHECK(ncclGetUniqueId(&uid));
-  ncclComm_t comm = nullptr;  // Mock comm for testing
-  NCCL_CHECK(ncclCommInitRank(&comm, 
-                      nccl_world_size, 
-                      uid, 
-                      nccl_rank));
+  if (nccl_world_size == 1) {
+    // Single-rank: generate a throwaway UID
+    NCCL_CHECK(ncclGetUniqueId(&uid));
+  } else {
+    std::string uid_str = uid_bytes;  // bytes → std::string (keeps raw data)
+    if (uid_str.empty()) {
+      // Back-compat path (old 6-arg call): each rank would generate its own UID → error.
+      // We throw to surface the issue clearly.
+      throw std::runtime_error("A shared NCCL unique ID must be provided when nccl_world_size > 1");
+    }
+    if (uid_str.size() != NCCL_UNIQUE_ID_BYTES) {
+      throw std::runtime_error("uid_bytes must have NCCL_UNIQUE_ID_BYTES length");
+    }
+    memcpy(&uid, uid_str.data(), NCCL_UNIQUE_ID_BYTES);
+  }
+
+  ncclComm_t comm = nullptr;
+  NCCL_CHECK(ncclCommInitRank(&comm, nccl_world_size, uid, nccl_rank));
   
   auto out = torch::empty_like(q);
   auto lse = torch::empty({q.size(0), q.size(2), q.size(1)}, q.options().dtype(at::kFloat));
@@ -281,5 +295,11 @@ torch::Tensor pipelined_fa(
 }
 
 PYBIND11_MODULE(pipelined_fa, m) {
-  m.def("pipelined_fa", &pipelined_fa, "Pipelined FlashAttention2 with overlapped NCCL");
+  namespace py = pybind11;
+  m.def("pipelined_fa", &pipelined_fa, 
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("chunk_size"),
+        py::arg("nccl_world_size"), py::arg("nccl_rank"),
+        py::arg("uid_bytes") = py::bytes(),
+        "Pipelined FlashAttention2 with overlapped NCCL");
 }

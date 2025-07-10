@@ -179,16 +179,16 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     if "80" in cuda_archs():
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_80,code=sm_80")
-    if CUDA_HOME is not None:
-        if bare_metal_version >= Version("11.8") and "90" in cuda_archs():
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
-        if bare_metal_version >= Version("12.8") and "100" in cuda_archs():
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_100,code=sm_100")
-        if bare_metal_version >= Version("12.8") and "120" in cuda_archs():
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_120,code=sm_120")
+    # if CUDA_HOME is not None:
+    #     if bare_metal_version >= Version("11.8") and "90" in cuda_archs():
+    #         cc_flag.append("-gencode")
+    #         cc_flag.append("arch=compute_90,code=sm_90")
+    #     if bare_metal_version >= Version("12.8") and "100" in cuda_archs():
+    #         cc_flag.append("-gencode")
+    #         cc_flag.append("arch=compute_100,code=sm_100")
+    #     if bare_metal_version >= Version("12.8") and "120" in cuda_archs():
+    #         cc_flag.append("-gencode")
+    #         cc_flag.append("arch=compute_120,code=sm_120")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -289,12 +289,12 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
-                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
-                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-                        # "-DFLASHATTENTION_DISABLE_LOCAL",
+                        "-DFLASHATTENTION_DISABLE_BACKWARD",
+                        "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        "-DFLASHATTENTION_DISABLE_ALIBI",
+                        "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                        "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
                     + cc_flag
                 ),
@@ -379,7 +379,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     "-DCK_ENABLE_INT8",
                     "-DCK_USE_XDL",
                     "-DUSE_PROF_API=1",
-                    # "-DFLASHATTENTION_DISABLE_BACKWARD",
+                    "-DFLASHATTENTION_DISABLE_BACKWARD",
                     "-D__HIP_PLATFORM_HCC__=1"]
 
         cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
