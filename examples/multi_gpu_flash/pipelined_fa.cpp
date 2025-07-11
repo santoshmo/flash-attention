@@ -124,6 +124,8 @@ struct PipelinedFA2 {
     local_rowmax_buf = torch::empty_like(rowmax_buf);
     local_sumexp_buf = torch::empty_like(sumexp_buf);
 
+    int terminal_rank = world_size - 1;         // owns the last chunk/token
+
     for (int chunk = 0; chunk < n_chunks + 1; ++chunk) {
       int buf_idx = chunk % 2; // TODO(santoshmo): needs to change? 
 
@@ -196,8 +198,15 @@ struct PipelinedFA2 {
 
         if (comm != nullptr && world_size > 1) {
           NCCL_CHECK(ncclGroupStart());
-          NCCL_CHECK(ncclAllReduce(g_rowmax, g_rowmax, count, ncclFloat32, ncclMax, comm, comm_stream));
-          NCCL_CHECK(ncclAllReduce(g_sumexp, g_sumexp, count, ncclFloat32, ncclSum, comm, comm_stream));
+          NCCL_CHECK(ncclAllReduce(g_rowmax, g_rowmax, count,
+                         ncclFloat32, ncclMax,  comm, comm_stream));
+
+          NCCL_CHECK(ncclReduce(g_sumexp,          // send buffer
+                      (rank == terminal_rank) ? g_sumexp : nullptr,
+                      count,
+                      ncclFloat32, ncclSum,
+                      terminal_rank,
+                      comm, comm_stream));
           NCCL_CHECK(ncclGroupEnd());
           
           // record completion once NCCL ops finish
@@ -212,38 +221,38 @@ struct PipelinedFA2 {
         }
         
         // 3) enqueue local renorm on compute_stream
-        cudaStreamWaitEvent(compute_stream, events[prev], 0);
-        
-        // Create combined stats buffers like the working unit test
-        // We need to interleave rowmax/sumexp as float2 pairs
-        auto global_stats_combined = torch::empty({B, H, len_prev, 2}, rowmax_buf[0].options());
-        auto local_stats_combined = torch::empty_like(global_stats_combined);
-        
-        // Copy data: select(-1,0) gets rowmax, select(-1,1) gets sumexp
-        global_stats_combined.select(-1, 0).copy_(g_rowmax_slice.view({B, H, len_prev}));
-        global_stats_combined.select(-1, 1).copy_(g_sumexp_slice.view({B, H, len_prev}));
-        local_stats_combined.select(-1, 0).copy_(l_rowmax_slice.view({B, H, len_prev}));
-        local_stats_combined.select(-1, 1).copy_(l_sumexp_slice.view({B, H, len_prev}));
-        
-        int threads = 256;
-        int elems = B * len_prev * H * D;  // Fix: len_prev comes before H  
-        int blocks = (elems + threads - 1) / threads;
-        
-        // Get the output slice for the previous chunk and make it contiguous
-        auto out_slice_prev = out.narrow(1, start_prev, len_prev).contiguous();
-        __half* out_ptr = reinterpret_cast<__half*>(out_slice_prev.data_ptr<at::Half>());
-        
-        renorm_kernel<<<blocks, threads, 0, compute_stream>>>(
-          out_ptr, 
-          reinterpret_cast<float2*>(global_stats_combined.data_ptr<float>()),
-          reinterpret_cast<float2*>(local_stats_combined.data_ptr<float>()),
-          B, H, len_prev, D
-        );
-        CUDA_CHECK("renorm_kernel");
-        
-        auto orig_out_slice = out.narrow(1, start_prev, len_prev);
-        if (!orig_out_slice.is_same(out_slice_prev)) {
-          orig_out_slice.copy_(out_slice_prev);
+        if (rank == terminal_rank) {
+            cudaStreamWaitEvent(compute_stream, events[prev], 0);
+            int threads = 256;
+            int elems = B * len_prev * H * D;  // Fix: len_prev comes before H  
+            int blocks = (elems + threads - 1) / threads;
+            
+            // Get the output slice for the previous chunk and make it contiguous
+            auto out_slice_prev = out.narrow(1, start_prev, len_prev).contiguous();
+            __half* out_ptr = reinterpret_cast<__half*>(out_slice_prev.data_ptr<at::Half>());
+            
+            // Create tensors for global and local stats
+            auto global_stats_combined = torch::empty({B, H, len_prev, 2}, g_rowmax_slice.options());
+            auto local_stats_combined  = torch::empty_like(global_stats_combined);
+
+            // Fill [B,H,len,0] with rowmax and [B,H,len,1] with sumexp
+            global_stats_combined.select(-1, 0).copy_(g_rowmax_slice.view({B, H, len_prev}));
+            global_stats_combined.select(-1, 1).copy_(g_sumexp_slice.view({B, H, len_prev}));
+            local_stats_combined.select(-1, 0).copy_(l_rowmax_slice.view({B, H, len_prev}));
+            local_stats_combined.select(-1, 1).copy_(l_sumexp_slice.view({B, H, len_prev}));
+
+            renorm_kernel<<<blocks, threads, 0, compute_stream>>>(
+              out_ptr, 
+              reinterpret_cast<float2*>(global_stats_combined.data_ptr<float>()),
+              reinterpret_cast<float2*>(local_stats_combined.data_ptr<float>()),
+              B, H, len_prev, D
+            );
+            CUDA_CHECK("renorm_kernel");
+            
+            auto orig_out_slice = out.narrow(1, start_prev, len_prev);
+            if (!orig_out_slice.is_same(out_slice_prev)) {
+              orig_out_slice.copy_(out_slice_prev);
+            }
         }
       }
     }

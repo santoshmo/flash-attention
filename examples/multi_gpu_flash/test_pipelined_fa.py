@@ -63,10 +63,13 @@ def main():
     # Placeholder: we simply assign one contiguous chunk per rank.
     # TODO: Replace with a proper load-balancing / sharding strategy.
     # ------------------------------------------------------------------
-    B, S, H, D = 1, pow(2, 22), 8, 64              # batch, heads, dim per head
+    B, S, H, D = 1, pow(2, 20), 8, 64              # batch, heads, dim per head
     print(f"Sequence length {S}")
+    
     tokens_per_rank = S // world_size            # sequence length handled by EACH rank
-    chunk_size      = tokens_per_rank // 2       # two chunk locally for now (assume it'll be a power of four)
+    num_chunks_per_gpu = 8
+    chunk_size      =  tokens_per_rank // num_chunks_per_gpu
+    print(f'num_chunks_per_gpu: {num_chunks_per_gpu} => chunk size: {chunk_size}')
 
     q = torch.randn(B, tokens_per_rank, H, D, device="cuda", dtype=torch.float16)
     k = torch.randn_like(q)
